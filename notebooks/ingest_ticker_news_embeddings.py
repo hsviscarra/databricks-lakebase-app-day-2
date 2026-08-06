@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
 # MAGIC %md
 # MAGIC # Ingest Ticker News -> Vector Embeddings (Lakebase)
 # MAGIC
@@ -153,6 +157,8 @@ print(f"Database: {parsed.path}")
 # DBTITLE 1,Test JDBC Connection
 # Test JDBC connection with embedded credentials
 try:
+    print(jdbc_url)
+    print(jdbc_properties)
     test_df = spark.read.jdbc(
         url=jdbc_url,
         table=WATCHLIST_TABLE_NAME,
@@ -197,13 +203,15 @@ except Exception as e:
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 11
+#Get massive
 import base64 as _b64
 import json as _json
 import time
 from datetime import datetime
 
 import requests
-from pyspark.sql.functions import col, current_timestamp, lit
+from pyspark.sql.functions import col, current_timestamp, lit, to_json, to_timestamp
 from pyspark.sql.types import StringType, StructField, StructType
 
 
@@ -257,11 +265,11 @@ def sync_news_to_spark(ticker: str, articles: list[dict]):
                 "author": article.get("author"),
                 "article_url": article.get("article_url"),
                 "publisher_name": publisher.get("name"),
-                "keywords": _json.dumps(article.get("keywords", [])),
+                "keywords": article.get("keywords", []),  # Keep as list
                 "sentiment": sentiment,
                 "sentiment_reasoning": sentiment_reasoning,
                 "published_utc": article.get("published_utc"),
-                "payload": _json.dumps(article),
+                "payload": _json.dumps(article),  # Keep as JSON string for now
             }
         )
 
@@ -269,7 +277,11 @@ def sync_news_to_spark(ticker: str, articles: list[dict]):
         return 0
 
     # Create DataFrame from API response
-    new_df = spark.createDataFrame(rows).withColumn("synced_at", current_timestamp())
+    # Convert keywords array to JSON string and published_utc string to timestamp
+    new_df = spark.createDataFrame(rows) \
+        .withColumn("synced_at", current_timestamp()) \
+        .withColumn("keywords", to_json(col("keywords"))) \
+        .withColumn("published_utc", to_timestamp(col("published_utc"), "yyyy-MM-dd'T'HH:mm:ss'Z'"))
 
     # Read existing article IDs to avoid duplicates
     try:
@@ -284,11 +296,18 @@ def sync_news_to_spark(ticker: str, articles: list[dict]):
         # Table might be empty or not exist yet - that's fine, write all rows
         pass
 
-    # Write new records
+    # Write new records using PostgreSQL-specific format (required for serverless)
+    # Serverless requires individual connection params, not a JDBC URL
     if new_df.count() > 0:
-        new_df.write.jdbc(
-            url=jdbc_url, table=NEWS_TABLE_NAME, mode="append", properties=jdbc_properties
-        )
+        new_df.write.format("postgresql") \
+            .option("host", parsed.hostname) \
+            .option("port", parsed.port or 5432) \
+            .option("database", parsed.path.lstrip("/")) \
+            .option("dbtable", NEWS_TABLE_NAME) \
+            .option("user", parsed.username) \
+            .option("password", parsed.password) \
+            .mode("append") \
+            .save()
         return new_df.count()
     return 0
 
@@ -362,6 +381,24 @@ display(news_df.limit(5))
 
 # COMMAND ----------
 
+# DBTITLE 1,Download embedding model to DBFS
+# Download the model once on the driver to the Volume (writable location)
+from sentence_transformers import SentenceTransformer
+
+# Unity Catalog Volume path (writable, accessible by all workers)
+MODEL_CACHE_PATH = "/Volumes/hv_external_catalog/watchlist_schema/ml_models"
+
+print(f"Downloading {EMBEDDING_MODEL_NAME} to {MODEL_CACHE_PATH}...")
+model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=MODEL_CACHE_PATH)
+print(f"✅ Model downloaded and cached at {MODEL_CACHE_PATH}")
+
+# Get embedding dimension for validation
+EMBEDDING_DIM = model.get_sentence_embedding_dimension()
+print(f"Embedding dimension: {EMBEDDING_DIM}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 15
 from typing import Iterator
 
 import pandas as pd
@@ -383,7 +420,8 @@ def embed_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]
     every batch of rows handed to this partition."""
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    # Load from Volume (already downloaded on driver)
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=MODEL_CACHE_PATH)
 
     for batch in iterator:
         vectors = model.encode(batch["embedding_text"].tolist(), show_progress_bar=False)
@@ -430,13 +468,15 @@ print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before 
 
 # COMMAND ----------
 
-from pyspark.sql.functions import current_timestamp, expr, lit
+# DBTITLE 1,Cell 19
+from pyspark.sql.functions import col, current_timestamp, expr, lit, to_timestamp
 from pyspark.sql.types import DoubleType
 
-# Add model_name and embedded_at columns
-embeddings_with_meta = embeddings_df.withColumn("model_name", lit(EMBEDDING_MODEL_NAME)).withColumn(
-    "embedded_at", current_timestamp()
-)
+# Add model_name and embedded_at columns, convert published_utc to timestamp
+embeddings_with_meta = embeddings_df \
+    .withColumn("model_name", lit(EMBEDDING_MODEL_NAME)) \
+    .withColumn("embedded_at", current_timestamp()) \
+    .withColumn("published_utc", to_timestamp(col("published_utc"), "yyyy-MM-dd HH:mm:ss"))
 
 # Convert embedding array from ArrayType(FloatType) to ArrayType(DoubleType)
 # Postgres JDBC expects DOUBLE PRECISION[] for vector columns
@@ -465,9 +505,15 @@ if embedding_count > 0:
     #   UPDATE ticker_news_embeddings 
     #   SET embedding = embedding::vector 
     #   WHERE embedding IS NOT NULL;
-    new_embeddings.write.jdbc(
-        url=jdbc_url, table=EMBEDDINGS_TABLE_NAME, mode="append", properties=jdbc_properties
-    )
+    new_embeddings.write.format("postgresql") \
+        .option("host", parsed.hostname) \
+        .option("port", parsed.port or 5432) \
+        .option("database", parsed.path.lstrip("/")) \
+        .option("dbtable", EMBEDDINGS_TABLE_NAME) \
+        .option("user", parsed.username) \
+        .option("password", parsed.password) \
+        .mode("append") \
+        .save()
     print(f"Wrote {embedding_count} new embeddings to {EMBEDDINGS_TABLE_NAME}")
     print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
     print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector;")
@@ -564,6 +610,7 @@ display(chunks_df.limit(5))
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 23
 chunk_embeddings_schema = StructType(
     [
         StructField("article_id", StringType(), False),
@@ -580,7 +627,8 @@ def embed_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.Data
     every batch of chunks handed to this partition."""
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    # Load from Volume (already downloaded on driver)
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=MODEL_CACHE_PATH)
 
     for batch in iterator:
         vectors = model.encode(batch["chunk_text"].tolist(), show_progress_bar=False)
@@ -620,6 +668,7 @@ print("\nRun sql/03_setup_chunk_embeddings_table.sql in your Lakebase database b
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 27
 # Add id (article_id_chunk_index), model_name, and embedded_at columns
 chunk_embeddings_with_meta = (
     chunk_embeddings_df.withColumn(
@@ -657,11 +706,114 @@ if chunk_count > 0:
     #   UPDATE ticker_news_chunk_embeddings 
     #   SET embedding = embedding::vector 
     #   WHERE embedding IS NOT NULL;
-    new_chunk_embeddings.write.jdbc(
-        url=jdbc_url, table=CHUNK_EMBEDDINGS_TABLE_NAME, mode="append", properties=jdbc_properties
-    )
+    new_chunk_embeddings.write.format("postgresql") \
+        .option("host", parsed.hostname) \
+        .option("port", parsed.port or 5432) \
+        .option("database", parsed.path.lstrip("/")) \
+        .option("dbtable", CHUNK_EMBEDDINGS_TABLE_NAME) \
+        .option("user", parsed.username) \
+        .option("password", parsed.password) \
+        .mode("append") \
+        .save()
     print(f"Wrote {chunk_count} new chunk embeddings to {CHUNK_EMBEDDINGS_TABLE_NAME}")
     print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
     print(f"  UPDATE {CHUNK_EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector;")
 else:
     print("No new chunk embeddings to write (all already exist).")
+
+# COMMAND ----------
+
+# DBTITLE 1,Verify All Tables
+print("🔍 CHECKING ALL TABLES FOR RECORDS")
+print("=" * 100)
+
+# TABLE 1: ticker_news_documents
+print("\n📰 TABLE 1: ticker_news_documents (Raw News Articles)")
+print("-" * 100)
+try:
+    news_check = spark.read.jdbc(
+        url=jdbc_url, 
+        table="ticker_news_documents", 
+        properties=jdbc_properties
+    )
+    news_count = news_check.count()
+    print(f"✅ Total rows: {news_count}")
+    
+    if news_count > 0:
+        print(f"\nDistinct tickers: {news_check.select('ticker').distinct().count()}")
+        print("\nTickers breakdown:")
+        news_check.groupBy("ticker").count().orderBy("count", ascending=False).show()
+        
+        print("\nSample records:")
+        news_check.select("id", "ticker", "title", "published_utc", "synced_at").show(3, truncate=50)
+    else:
+        print("⚠️  No records found!")
+except Exception as e:
+    print(f"❌ Error: {e}")
+
+# TABLE 2: ticker_news_embeddings
+print("\n" + "=" * 100)
+print("🎯 TABLE 2: ticker_news_embeddings (Title/Description Vectors)")
+print("-" * 100)
+try:
+    embeddings_check = spark.read.jdbc(
+        url=jdbc_url, 
+        table="ticker_news_embeddings", 
+        properties=jdbc_properties
+    )
+    embeddings_count = embeddings_check.count()
+    print(f"✅ Total rows: {embeddings_count}")
+    
+    if embeddings_count > 0:
+        print(f"\nDistinct tickers: {embeddings_check.select('ticker').distinct().count()}")
+        
+        # Sample records
+        print("\nSample records:")
+        embeddings_check.select("id", "ticker", "title", "model_name", "embedded_at").show(3, truncate=50)
+        
+        # Check embedding dimensions
+        first_embedding = embeddings_check.select("embedding").first()
+        if first_embedding:
+            emb_array = first_embedding["embedding"]
+            print(f"\n📊 Embedding dimension: {len(emb_array)} (should be 384)")
+            print(f"   Sample embedding values (first 5): {emb_array[:5]}")
+    else:
+        print("⚠️  No records found!")
+except Exception as e:
+    print(f"❌ Error: {e}")
+
+# TABLE 3: ticker_news_chunk_embeddings
+print("\n" + "=" * 100)
+print("📝 TABLE 3: ticker_news_chunk_embeddings (Content Chunk Vectors)")
+print("-" * 100)
+try:
+    chunks_check = spark.read.jdbc(
+        url=jdbc_url, 
+        table="ticker_news_chunk_embeddings", 
+        properties=jdbc_properties
+    )
+    chunks_count = chunks_check.count()
+    print(f"✅ Total rows: {chunks_count}")
+    
+    if chunks_count > 0:
+        print(f"\nDistinct articles: {chunks_check.select('article_id').distinct().count()}")
+        print(f"\nChunks per article (top 5):")
+        chunks_check.groupBy("article_id").count().orderBy("count", ascending=False).show(5)
+        
+        # Sample records
+        print("\nSample records:")
+        chunks_check.select("id", "article_id", "ticker", "chunk_index", "model_name").show(3, truncate=50)
+        
+        # Check embedding dimensions
+        first_chunk_embedding = chunks_check.select("embedding").first()
+        if first_chunk_embedding:
+            chunk_emb_array = first_chunk_embedding["embedding"]
+            print(f"\n📊 Embedding dimension: {len(chunk_emb_array)} (should be 384)")
+    else:
+        print("⚠️  No records found!")
+except Exception as e:
+    print(f"❌ Error: {e}")
+
+print("\n" + "=" * 100)
+print("✅ VERIFICATION COMPLETE")
+print("=" * 100)
